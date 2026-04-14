@@ -12,54 +12,49 @@
 #include <U8g2lib.h>        // OLED 显示库
 #include <Keypad.h>         // 4x4矩阵键盘库
 #include <PubSubClient.h>
-
-// =================================================================
-// ==                      网络与API配置                           ==
-// =================================================================
+#include <Adafruit_NeoPixel.h>  
+// ======================== 网络与 API 配置 ========================
 const char *ssid = "waveshare";    // 你的WiFi SSID
 const char *password = "12345678"; // 你的WiFi密码
 
-// 百度AI开放平台 API Key
-String apiKey = "9kp0pGBQbQpOQqEfLAnYWOmy";
-String secretKey = "q95IU4v99OMrZvdj9NHXbiOZ9LLVYXTn";
+// Qwen (阿里云百炼) API 配置
+String qwenApiKey = "sk-8003480a642b4c75aaf683be2bea5355"; // 阿里云百炼 API Key
+const char *apiUrl = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
 
-// API端点URL
-const char *tokenUrl = "https://aip.baidubce.com/oauth/2.0/token";
-const char *apiUrl = "https://aip.baidubce.com/rest/2.0/image-classify/v1/classify/ingredient";
+// =========================== OneNet 配置 ==========================
+const char *mqtt_server_onenet = "mqtts.heclouds.com"; 
+const int mqtt_port_onenet = 1883;
 
-// =================================================================
-// ==                     OneNet 配置                      ==
-// =================================================================
-const char *mqtt_server = "mqtts.heclouds.com"; // OneNet Studio地址
-const int mqtt_port = 1883;
-
-// OneNet鉴权信息
 const char *onenet_product_id = "96LmRjv77N";
 const char *onenet_device_id = "niu";
-const char *onenet_token = "version=2018-10-31&res=products%2F96LmRjv77N%2Fdevices%2Fniu&et=2000000000&method=md5&sign=fZy20DseTrk7WWVOOqh9GA%3D%3D"; // 或者是密码/AccessKey
-
-// OneNet 物模型上报 Topic
+const char *onenet_token = "version=2018-10-31&res=products%2F96LmRjv77N%2Fdevices%2Fniu&et=2000000000&method=md5&sign=fZy20DseTrk7WWVOOqh9GA%3D%3D"; 
 const char *onenet_topic_post = "$sys/96LmRjv77N/niu/thing/property/post";
 
-// 初始化 WiFiClient 和 PubSubClient
-WiFiClient espClient;
-PubSubClient mqttClient(espClient);
+// ===================== 公共 MQTT 配置（小程序直连） =====================
+const char *mqtt_server_public = "broker.emqx.io";
+const int mqtt_port_public = 1883;
+// ClientID 需唯一，可加随机数避免冲突
+const char *public_client_id = "esp32_scale_device_niu_8848"; 
+const char *public_topic_post = "smart_scale/app/data_stream";
 
-// =================================================================
-// ==                       硬件引脚配置                           ==
-// =================================================================
+// ===================== 初始化双路 WiFiClient 客户端 =====================
+WiFiClient espClientOneNet;
+PubSubClient mqttClientOneNet(espClientOneNet);
+
+WiFiClient espClientPublic;
+PubSubClient mqttClientPublic(espClientPublic);
+
+// =========================== 硬件引脚配置 ==========================
 #define JPG_SERIAL_RX_PIN 18 // 图像串口接收引脚 (连接到图像发送模块的TX)
-#define JPG_SERIAL_TX_PIN 17 // 图像串口发送引脚 (连接到图像发送模块的RX)
+//#define JPG_SERIAL_TX_PIN 17 // 图像串口发送引脚 (连接到图像发送模块的RX)
+#define JPG_SERIAL_TX_PIN 1  // 使用空闲 1 引脚接摄像头板 RX (44)
 #define SD_CS_PIN 10         // SD卡片选引脚
 #define SD_MOSI_PIN 11       // SD卡MOSI引脚
 #define SD_MISO_PIN 13       // SD卡MISO引脚
 #define SD_SCK_PIN 12        // SD卡时钟引脚
 #define HX711_DOUT_PIN 4     // HX711数据输出引脚
 #define HX711_SCK_PIN 5      // HX711时钟引脚
-#define RED_PIN 42
-#define GREEN_PIN 2
-#define BLUE_PIN 1
-#define GND_PIN 41
+#define RGB_LED_PIN 48       // led
 const byte KEYPAD_ROWS = 4;
 const byte KEYPAD_COLS = 4;
 char keys[KEYPAD_ROWS][KEYPAD_COLS] = {
@@ -71,9 +66,7 @@ char keys[KEYPAD_ROWS][KEYPAD_COLS] = {
 byte rowPins[KEYPAD_ROWS] = {47, 21, 20, 19};
 byte colPins[KEYPAD_COLS] = {16, 15, 7, 6};
 
-// =================================================================
-// ==                       软件与协议配置                         ==
-// =================================================================
+// ========================= 软件与协议配置 =========================
 enum SystemMode
 {
   AUTOMATIC_MODE,
@@ -85,20 +78,19 @@ const uint8_t START_MARKER[] = {0xAB, 0xCD, 0xEF};
 const uint8_t END_MARKER[] = {0xFE, 0xDC, 0xBA};
 float calibration_factor = 460;
 
-// =================================================================
-// ==                   FreeRTOS 任务与同步句柄                    ==
-// =================================================================
+
+// ===================== FreeRTOS 任务与同步句柄 =====================
 TaskHandle_t wifiManagementTaskHandle;
-TaskHandle_t oledDisplayTaskHandle;
+TaskHandle_t lcdDisplayTaskHandle;
 TaskHandle_t oneNetTaskHandle;
+TaskHandle_t aiRecognitionTaskHandle; // AI 后台识别任务句柄
+
 EventGroupHandle_t wifiEventGroup;
 SemaphoreHandle_t displayDataMutex;
+SemaphoreHandle_t aiDataMutex;        // 用于保护 AI 任务数据的锁
 const int WIFI_CONNECTED_BIT = BIT0;
 
-// =================================================================
-// ==                      全局对象与变量                          ==
-// =================================================================
-
+// ========================= 全局对象与变量 =========================
 HardwareSerial ASRSerial(2);
 #define ASR_RX_PIN 45
 #define ASR_TX_PIN 48
@@ -109,24 +101,29 @@ HX711 scale;
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/U8X8_PIN_NONE);
 Keypad customKeypad = Keypad(makeKeymap(keys), rowPins, colPins, KEYPAD_ROWS, KEYPAD_COLS);
 
+Adafruit_NeoPixel onboardLED(1, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
+
 std::map<String, String> priceList;
 String lastRecognizedItemName = "";
 float lastUnitPrice = 0.0;
 String manualPriceInput = "";
 
-String cachedAccessToken = "";
-unsigned long lastTokenTime = 0;
-const unsigned long tokenValidityPeriod = 24 * 3600 * 1000UL;
+// 全局重量缓存，防止多任务争抢 HX711 死锁，提高读取速度
+volatile float global_weight = 0.0; 
 
-// =================================================================
-// ==                         函数声明                             ==
-// =================================================================
+// AI 后台识别所需变量
+volatile bool isRecognizing = false;
+String pendingImageBase64 = "";
+
+// ============================ 函数声明 ============================
 void wifiManagementTask(void *pvParameters);
-void oledDisplayTask(void *pvParameters);
+void lcdDisplayTask(void *pvParameters);
 void oneNetDataTask(void *pvParameters);
-String getAccessToken();
-String urlEncode(String str);
-String recognizeIngredient(String accessToken, String base64Image);
+void aiRecognitionTask(void *pvParameters); // 【优化】新增任务：负责处理耗时的AI网络请求
+
+// 参数采用 const String&，避免大字符串深拷贝
+String recognizeIngredient(const String& base64Image); 
+
 void loadPriceList();
 bool findStartMarker();
 void flushSerialBuffer(size_t count);
@@ -137,27 +134,22 @@ void performTare();
 void handleAutomaticMode();
 void handleManualMode();
 void handleAsrInput();
-
-// =================================================================
-// ==                        主程序 Setup                          ==
-// =================================================================
+// =========================== 主程序 Setup ==========================
 void setup()
 {
   Serial.begin(115200);
   while (!Serial)
     ;
-  Serial.println("\n\n--- ESP32-S3 双模式智能计价系统 ---");
+  Serial.println("\n\n--- ESP32-S3 双模式智能计价系统 (Qwen AI 优化版) ---");
   Serial.printf("主程序 setup() 运行在核心: %d\n", xPortGetCoreID());
 
   ASRSerial.begin(9600, SERIAL_8N1, ASR_RX_PIN, ASR_TX_PIN);
-  Serial.println("ASRPRO 语音识别模块串口已在 GPIO 9/8 上初始化。");
+  Serial.println("ASRPRO 语音识别模块串口已在 GPIO 45/48 上初始化。");
 
-  pinMode(GND_PIN, OUTPUT);
-  digitalWrite(GND_PIN, LOW);
-  pinMode(RED_PIN, OUTPUT);
-  pinMode(GREEN_PIN, OUTPUT);
-  pinMode(BLUE_PIN, OUTPUT);
-  setLED(3); // 蓝色灯表示启动中
+  onboardLED.begin();
+  onboardLED.setBrightness(50); // 设置亮度(0-255)，50为推荐值
+  onboardLED.show();
+  setLED(3); // 启动时显示蓝色（手动模式）
 
   u8g2.begin();
   u8g2.enableUTF8Print();
@@ -174,6 +166,8 @@ void setup()
   }
   Serial.printf("PSRAM 总大小: %d bytes, 可用: %d bytes\n", ESP.getPsramSize(), ESP.getFreePsram());
 
+  // 分配更大串口接收缓冲区(32KB)，防止高波特率下丢包
+  JPGSerial.setRxBufferSize(32768); 
   JPGSerial.begin(921600, SERIAL_8N1, JPG_SERIAL_RX_PIN, JPG_SERIAL_TX_PIN);
 
   Serial.println("正在初始化 HX711 称重模块...");
@@ -183,15 +177,21 @@ void setup()
   Serial.println("HX711 初始化完成，已去皮。");
 
   displayDataMutex = xSemaphoreCreateMutex();
+  aiDataMutex = xSemaphoreCreateMutex(); // 初始化 AI 数据锁
   wifiEventGroup = xEventGroupCreate();
-  // 【新增】配置MQTT服务器参数
-  mqttClient.setServer(mqtt_server, mqtt_port);
-  // 【新增】增大MQTT缓冲区，防止JSON数据过长导致发送失败
-  mqttClient.setBufferSize(512);
-  // Wifi管理任务会在后台自动连接，主程序无需等待
+  
+  mqttClientOneNet.setServer(mqtt_server_onenet, mqtt_port_onenet);
+  mqttClientOneNet.setBufferSize(512);
+
+  mqttClientPublic.setServer(mqtt_server_public, mqtt_port_public);
+  mqttClientPublic.setBufferSize(512);
+  
   xTaskCreatePinnedToCore(wifiManagementTask, "WiFiTask", 4096, NULL, 1, &wifiManagementTaskHandle, 0);
-  xTaskCreatePinnedToCore(oledDisplayTask, "OLEDTask", 4096, NULL, 2, &oledDisplayTaskHandle, 0);
+  xTaskCreatePinnedToCore(lcdDisplayTask, "LCDTask", 4096, NULL, 2, &lcdDisplayTaskHandle, 0);
   xTaskCreatePinnedToCore(oneNetDataTask, "OneNetTask", 4096, NULL, 1, &oneNetTaskHandle, 1);
+  
+  // 分配 8KB 栈给 AI 任务，核心 0 处理网络请求
+  xTaskCreatePinnedToCore(aiRecognitionTask, "AITask", 8192, NULL, 1, &aiRecognitionTaskHandle, 0);
 
   Serial.println("正在初始化 SD 卡...");
   SDSPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, -1);
@@ -206,38 +206,24 @@ void setup()
   loadPriceList();
 
   Serial.println("系统正在启动，WiFi将在后台连接...");
-  Serial.println("正在尝试获取初始 Access Token...");
-  // 延迟一小段时间，给WiFi连接的机会
-  vTaskDelay(pdMS_TO_TICKS(3000));
-
-  if (WiFi.status() == WL_CONNECTED)
-  {
-    cachedAccessToken = getAccessToken();
-    if (cachedAccessToken.length() > 0)
-    {
-      lastTokenTime = millis();
-      Serial.println("Access Token 获取成功!");
-    }
-    else
-    {
-      Serial.println("警告: 无法获取 Access Token，自动模式可能不可用。");
-    }
-  }
-  else
-  {
-    Serial.println("警告: WiFi未连接，无法获取Access Token，自动模式暂不可用。");
-  }
-
   Serial.println("\n--- 系统初始化完成，当前为手动模式 ---");
 }
 
-// =================================================================
-// ==   主循环: 负责键盘检测与模式逻辑分发                        ==
-// =================================================================
+// =========================== 主循环 loop ===========================
+// 负责键盘检测、传感器读取与模式分发
 void loop()
 {
+  // 非阻塞读取重量，缓存到全局变量
+  if (scale.is_ready()) {
+    float temp_weight = scale.get_units(3); // 降低采样数到3，大幅提升循环帧率
+    if (temp_weight >= 0) {
+      global_weight = temp_weight; 
+    }
+  }
+
   handleKeypadInput();
   handleAsrInput();
+  
   if (currentMode == AUTOMATIC_MODE)
   {
     handleAutomaticMode();
@@ -248,29 +234,23 @@ void loop()
   }
 }
 
-// =================================================================
-// == 自动识别模式下的核心逻辑                              ==
-// =================================================================
+// ===================== 自动识别模式核心逻辑 =====================
 void handleAutomaticMode()
 {
-  // 在自动模式开始时，检查WiFi和Token
   if ((xEventGroupGetBits(wifiEventGroup) & WIFI_CONNECTED_BIT) == 0)
   {
     Serial.println("自动模式错误: WiFi 未连接!");
-    // 可以在OLED上显示错误信息
     u8g2.clearBuffer();
     u8g2.setFont(u8g2_font_wqy12_t_gb2312);
     u8g2.drawUTF8(10, 38, "错误: WiFi未连接!");
     u8g2.sendBuffer();
     delay(2000);
-    // 自动切回手动模式，避免卡死
     currentMode = MANUAL_MODE;
     return;
   }
 
   if (findStartMarker())
   {
-    // ... (此处省略未修改的图像处理代码)
     uint32_t image_size = 0;
     if (JPGSerial.readBytes((uint8_t *)&image_size, sizeof(image_size)) != sizeof(image_size))
     {
@@ -312,77 +292,46 @@ void handleAutomaticMode()
     unsigned long startTime = millis();
     size_t encoded_len = 0;
     mbedtls_base64_encode(NULL, 0, &encoded_len, imageBuffer, image_size);
-    char *base64_buf = (char *)malloc(encoded_len);
+    
+    // Base64 字符串放入 PSRAM，防止内存溢出
+    char *base64_buf = (char *)ps_malloc(encoded_len);
     if (!base64_buf)
     {
-      Serial.println("错误: Base64内存分配失败!");
+      Serial.println("错误: Base64 PSRAM内存分配失败!");
       free(imageBuffer);
       return;
     }
     mbedtls_base64_encode((unsigned char *)base64_buf, encoded_len, &encoded_len, imageBuffer, image_size);
-    free(imageBuffer);
+    free(imageBuffer); // 释放原始图片内存
     String imageBase64(base64_buf);
-    free(base64_buf);
+    free(base64_buf);  // 释放C字符串内存
     Serial.printf("Base64编码完成, 耗时: %lu ms\n", millis() - startTime);
 
-    if (millis() - lastTokenTime > tokenValidityPeriod || cachedAccessToken.length() == 0)
+    // 不阻塞等待 API，Base64 数据交由后台 AI 任务
+    if (xSemaphoreTake(aiDataMutex, pdMS_TO_TICKS(100)) == pdTRUE)
     {
-      Serial.println("正在刷新或获取 Access Token...");
-      String newAccessToken = getAccessToken();
-      if (newAccessToken.length() > 0)
+      if (!isRecognizing) 
       {
-        cachedAccessToken = newAccessToken;
-        lastTokenTime = millis();
-        Serial.println("Access Token 获取成功!");
+        pendingImageBase64 = imageBase64;
+        isRecognizing = true;
+        Serial.println("图像已交由后台 AI 任务处理，系统恢复监听按键与语音...");
       }
-      else
+      else 
       {
-        Serial.println("错误: Access Token 获取失败。无法进行识别。");
-        // 可以在OLED上显示错误
-        u8g2.clearBuffer();
-        u8g2.setFont(u8g2_font_wqy12_t_gb2312);
-        u8g2.drawUTF8(10, 38, "错误: Token获取失败");
-        u8g2.sendBuffer();
-        delay(2000);
-        currentMode = MANUAL_MODE; // 切回手动模式
-        return;
+        Serial.println("警告: 上一张图像仍在识别中，忽略当前图像。");
       }
+      xSemaphoreGive(aiDataMutex);
     }
-
-    Serial.println("正在发送图像进行识别...");
-    startTime = millis();
-    String recognizedName = recognizeIngredient(cachedAccessToken, imageBase64);
-    Serial.printf("识别流程完成, 耗时: %lu ms\n", millis() - startTime);
-
-    if (recognizedName.length() > 0)
-    {
-      if (xSemaphoreTake(displayDataMutex, portMAX_DELAY) == pdTRUE)
-      {
-        lastRecognizedItemName = recognizedName;
-        lastUnitPrice = priceList.count(recognizedName) ? priceList[recognizedName].toFloat() : 0.0;
-        xSemaphoreGive(displayDataMutex);
-      }
-      Serial.printf("\n--- 识别结果 ---\n==================================\n  商品: %s\n  单价: %.2f 元/千克\n==================================\n", recognizedName.c_str(), lastUnitPrice);
-    }
-    else
-    {
-      Serial.println("识别失败或API未返回有效结果。");
-    }
-    Serial.println("\n--- 系统准备就绪，等待下一张图片... ---");
   }
 }
 
-// =================================================================
-// == 自定义价格模式下的核心逻辑                              ==
-// =================================================================
+// ===================== 手动价格模式核心逻辑 =====================
 void handleManualMode()
 {
-  delay(20);
+  delay(10); // 降低空转功耗
 }
 
-// =================================================================
-// == 处理键盘输入                                         ==
-// =================================================================
+// =========================== 键盘输入处理 ===========================
 void handleKeypadInput()
 {
   char key = customKeypad.getKey();
@@ -453,9 +402,65 @@ void handleKeypadInput()
   }
 }
 
-// =================================================================
-// == 执行去皮操作的函数                                   ==
-// =================================================================
+// =========================== 语音指令处理 ===========================
+void handleAsrInput()
+{
+  if (ASRSerial.available())
+  {
+    uint8_t command = ASRSerial.read(); 
+    Serial.printf("收到语音指令代码: 0x%02X\n", command);
+
+    switch (command)
+    {
+    case 0x01: 
+      Serial.println("语音指令: 执行去皮。");
+      performTare();
+      break;
+
+    case 0x02: 
+      Serial.println("语音指令: 切换模式。");
+      if (currentMode == AUTOMATIC_MODE)
+      {
+        currentMode = MANUAL_MODE;
+        Serial.println("模式切换 -> 自定义价格模式");
+      }
+      else
+      {
+        currentMode = AUTOMATIC_MODE;
+        Serial.println("模式切换 -> 自动识别模式");
+      }
+      if (xSemaphoreTake(displayDataMutex, portMAX_DELAY) == pdTRUE)
+      {
+        lastRecognizedItemName = "";
+        lastUnitPrice = 0.0;
+        manualPriceInput = "";
+        xSemaphoreGive(displayDataMutex);
+      }
+      break;
+
+    case 0x03: 
+      if (currentMode == MANUAL_MODE && manualPriceInput.length() > 0)
+      {
+        Serial.println("语音指令: 确认价格。");
+        if (xSemaphoreTake(displayDataMutex, portMAX_DELAY) == pdTRUE)
+        {
+          lastUnitPrice = manualPriceInput.toFloat();
+          lastRecognizedItemName = "自定义商品";
+          manualPriceInput = "";
+          xSemaphoreGive(displayDataMutex);
+          Serial.printf("自定义价格已设定: %.2f 元/千克\n", lastUnitPrice);
+        }
+      }
+      break;
+
+    default:
+      Serial.println("收到未知语音指令。");
+      break;
+    }
+  }
+}
+
+// =========================== 去皮操作函数 ===========================
 void performTare()
 {
   Serial.println("'B'键按下，执行去皮操作...");
@@ -465,41 +470,49 @@ void performTare()
   u8g2.sendBuffer();
 
   scale.tare();
+  global_weight = 0.0; // 去皮后重置全局重量
 
   Serial.println("去皮完成。");
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_wqy12_t_gb2312);
   u8g2.drawUTF8(34, 38, "去皮完成");
   u8g2.sendBuffer();
-  delay(1000);
+  delay(1000); // OLED 显示提示，短暂阻塞可接受
 }
-
-// =================================================================
-// == OLED显示任务 (后台运行)  ==
-// =================================================================
-void oledDisplayTask(void *pvParameters)
+// =========================== LCD 显示任务 ===========================
+// 后台高刷新率运行
+void lcdDisplayTask(void *pvParameters)
 {
-  Serial.printf("OLED 显示任务已在核心 %d 上启动。\n", xPortGetCoreID());
-  char line1[64], line2[32], line3[32], modeStr[32];
+  Serial.printf("LCD 显示任务已在核心 %d 上启动。\n", xPortGetCoreID());
+  char line1[64], line2[32], line3[32];
 
   String itemNameForDisplay;
   float unitPriceForDisplay;
   String priceInputForDisplay;
+  bool aiIsWorking = false;
 
   for (;;)
   {
-    float currentWeight = getWeight();
+    // 直接读取全局重量缓存，极快
+    float currentWeight = global_weight;
     if (currentWeight < 1)
     {
       currentWeight = 0;
     }
 
-    if (xSemaphoreTake(displayDataMutex, pdMS_TO_TICKS(100)) == pdTRUE)
+    if (xSemaphoreTake(displayDataMutex, pdMS_TO_TICKS(50)) == pdTRUE)
     {
       itemNameForDisplay = lastRecognizedItemName;
       unitPriceForDisplay = lastUnitPrice;
       priceInputForDisplay = manualPriceInput;
       xSemaphoreGive(displayDataMutex);
+    }
+    
+    // 检查 AI 是否正在后台识别
+    if (xSemaphoreTake(aiDataMutex, pdMS_TO_TICKS(10)) == pdTRUE)
+    {
+      aiIsWorking = isRecognizing;
+      xSemaphoreGive(aiDataMutex);
     }
 
     float totalPrice = (currentWeight / 1000.0) * unitPriceForDisplay;
@@ -509,13 +522,16 @@ void oledDisplayTask(void *pvParameters)
 
     if (currentMode == AUTOMATIC_MODE)
     {
-      if (itemNameForDisplay.length() > 0)
+      if (aiIsWorking) 
+      {
+        strcpy(line1, "状态: 正在向AI识别...");
+      }
+      else if (itemNameForDisplay.length() > 0)
       {
         snprintf(line1, sizeof(line1), "%s/%.2f元/kg", itemNameForDisplay.c_str(), unitPriceForDisplay);
       }
       else
       {
-        // 在自动模式下，如果WiFi断开，也给提示
         if ((xEventGroupGetBits(wifiEventGroup) & WIFI_CONNECTED_BIT) == 0)
         {
           strcpy(line1, "模式:自动-无网络!");
@@ -549,25 +565,48 @@ void oledDisplayTask(void *pvParameters)
     u8g2.drawUTF8(0, 38, line2);
     u8g2.drawUTF8(0, 60, line3);
     u8g2.sendBuffer();
+    // 实时打包 JSON 数据发给摄像头屏幕
+    String screenItemName = itemNameForDisplay;
+    
+    // 商品名称为空时，显示友好提示
+    if (screenItemName.length() == 0) {
+      if (aiIsWorking) screenItemName = "AI云端识别中...";
+      else if (currentMode == MANUAL_MODE) screenItemName = "手动计价模式";
+      else screenItemName = "等待拍照识别...";
+    }
 
-    vTaskDelay(pdMS_TO_TICKS(150));
+    // 注意结尾需加 \n，摄像头板按换行拆包
+char screenJson[256];
+    snprintf(screenJson, sizeof(screenJson),
+             "{\"item\":\"%s\",\"weight\":%.0f,\"price\":%.2f,\"total\":%.2f,\"input\":\"%s\"}\n", 
+             screenItemName.c_str(), currentWeight, unitPriceForDisplay, totalPrice, priceInputForDisplay.c_str());
+    
+    // 仅数据变化时才发送，避免串口堵塞
+    static String lastSentJson = "";
+    String currentJson = String(screenJson);
+    
+    //
+    if (currentJson != lastSentJson) {
+      JPGSerial.print(screenJson);
+      lastSentJson = currentJson;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(100)); // 10Hz 刷新率，画面流畅
   }
 }
 
-// =================================================================
-// ==         核心0 (Core 0) WiFi管理任务 (后台运行)              ==
-// =================================================================
+// =========================== WiFi 管理任务（核心 0） ===========================
+// 后台运行
 void wifiManagementTask(void *pvParameters)
 {
   Serial.printf("WiFi 管理任务已在核心 %d 上启动。\n", xPortGetCoreID());
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED)
   {
-    // 启动时非阻塞地尝试连接
     if (millis() > 30000 && WiFi.status() != WL_CONNECTED)
     {
       Serial.println("启动30秒后WiFi仍未连接，将继续在后台尝试...");
-      break; // 30秒后不再阻塞，让主程序继续
+      break; 
     }
     Serial.print(".");
     vTaskDelay(pdMS_TO_TICKS(500));
@@ -600,57 +639,100 @@ void wifiManagementTask(void *pvParameters)
   }
 }
 
-// =================================================================
-// ==         【修正版】OneNet 数据发送任务 (已修复JSON格式错误)       ==
-// =================================================================
+// =========================== AI 后台识别任务 ===========================
+// 彻底释放主循环
+void aiRecognitionTask(void *pvParameters)
+{
+  Serial.printf("AI 异步识别任务已在核心 %d 上启动。\n", xPortGetCoreID());
+  for (;;)
+  {
+    String localBase64 = "";
+    
+    // 检查是否有等待处理的图片
+    if (xSemaphoreTake(aiDataMutex, pdMS_TO_TICKS(50)) == pdTRUE)
+    {
+      if (isRecognizing && pendingImageBase64.length() > 0)
+      {
+        localBase64 = pendingImageBase64; // 拷贝到本地
+        pendingImageBase64 = "";          // 立即清空全局缓存释放内存
+      }
+      xSemaphoreGive(aiDataMutex);
+    }
+
+    if (localBase64.length() > 0)
+    {
+      Serial.println("后台 AI 任务: 正在发送图像至 Qwen 进行识别...");
+      unsigned long startTime = millis();
+      
+      // 调用识别 API
+      String recognizedName = recognizeIngredient(localBase64);
+      
+      Serial.printf("后台 AI 任务: 识别流程完成, 耗时: %lu ms\n", millis() - startTime);
+
+      if (recognizedName.length() > 0)
+      {
+        if (xSemaphoreTake(displayDataMutex, portMAX_DELAY) == pdTRUE)
+        {
+          lastRecognizedItemName = recognizedName;
+          lastUnitPrice = priceList.count(recognizedName) ? priceList[recognizedName].toFloat() : 0.0;
+          xSemaphoreGive(displayDataMutex);
+        }
+        Serial.printf("\n--- 识别结果 ---\n  商品: %s\n  单价: %.2f 元/千克\n----------------\n", recognizedName.c_str(), lastUnitPrice);
+      }
+      else
+      {
+        Serial.println("识别失败或API未返回有效结果。");
+      }
+
+      // 重置识别状态
+      if (xSemaphoreTake(aiDataMutex, portMAX_DELAY) == pdTRUE)
+      {
+        isRecognizing = false;
+        xSemaphoreGive(aiDataMutex);
+      }
+      Serial.println("--- 系统准备就绪，等待下一张图片... ---");
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(100)); // 闲置时休眠，不占CPU
+  }
+}
+
+// =========================== 双路 MQTT 数据发送任务 ===========================
+// 发往 OneNet 与小程序
 void oneNetDataTask(void *pvParameters)
 {
-  Serial.printf("OneNet 任务已在核心 %d 上启动。\n", xPortGetCoreID());
+  Serial.printf("双路 MQTT 发送任务已在核心 %d 上启动。\n", xPortGetCoreID());
 
-  // 临时变量用于存储要发送的数据
   String currentItem;
   float currentPrice = 0.0;
   float currentWeight = 0.0;
   float currentTotal = 0.0;
-
-  // 缓冲区足够大，防止JSON截断
   char jsonBuffer[1024];
-
-  // 定义应答 Topic (用于接收平台回复，消除 subscription not exist 警告)
+  
   String replyTopic = String(onenet_topic_post) + "/reply";
 
   for (;;)
   {
-    // 1. 检查WiFi是否连接
     if (WiFi.status() == WL_CONNECTED)
     {
-
-      // 2. 检查MQTT连接
-      if (!mqttClient.connected())
+      // 1. 维护 OneNet 连接
+      if (!mqttClientOneNet.connected())
       {
-        Serial.print("尝试连接 OneNet MQTT...");
-        // 尝试连接
-        if (mqttClient.connect(onenet_device_id, onenet_product_id, onenet_token))
+        if (mqttClientOneNet.connect(onenet_device_id, onenet_product_id, onenet_token))
         {
-          Serial.println("连接成功!");
-          // 连接成功后，务必订阅应答 Topic
-          mqttClient.subscribe(replyTopic.c_str());
-          Serial.println("已订阅应答 Topic: " + replyTopic);
-        }
-        else
-        {
-          Serial.print("失败, rc=");
-          Serial.print(mqttClient.state());
-          Serial.println(" 3秒后重试");
-          vTaskDelay(pdMS_TO_TICKS(3000));
-          continue;
+          mqttClientOneNet.subscribe(replyTopic.c_str());
         }
       }
 
-      // 3. 安全地获取数据 (加锁防止读取时数据突变)
-      currentWeight = getWeight();
-      if (currentWeight < 1)
-        currentWeight = 0;
+      // 2. 维护 公共 EMQX 连接
+      if (!mqttClientPublic.connected())
+      {
+        mqttClientPublic.connect(public_client_id);
+      }
+
+      // 3. 获取数据并打包为 JSON
+      currentWeight = global_weight; // 使用内存中的重量，不阻塞
+      if (currentWeight < 1) currentWeight = 0;
 
       if (xSemaphoreTake(displayDataMutex, pdMS_TO_TICKS(100)) == pdTRUE)
       {
@@ -663,66 +745,36 @@ void oneNetDataTask(void *pvParameters)
         currentItem = "Unknown";
       }
 
-      // 防止商品名为空导致 JSON 格式错误
-      if (currentItem.length() == 0)
-        currentItem = "None";
-
+      if (currentItem.length() == 0) currentItem = "None";
       currentTotal = (currentWeight / 1000.0) * currentPrice;
 
-      // 4. 构造 JSON (符合 OneNet Studio 物模型标准)
-      // 注意：必须使用 {"value": 值} 的嵌套结构，否则报错 302
       snprintf(jsonBuffer, sizeof(jsonBuffer),
                "{\"id\": \"%lu\", \"version\": \"1.0\", \"params\": {"
-               "\"Weight\": { \"value\": %.2f },"    // 数值型，保留2位小数
-               "\"UnitPrice\": { \"value\": %.2f }," // 数值型
-               "\"TotalCost\": { \"value\": %.2f }," // 数值型
-               "\"ItemName\": { \"value\": \"%s\" }" // 字符串型，值需要引号
+               "\"Weight\": { \"value\": %.2f },"    
+               "\"UnitPrice\": { \"value\": %.2f }," 
+               "\"TotalCost\": { \"value\": %.2f }," 
+               "\"ItemName\": { \"value\": \"%s\" }" 
                "}}",
-               millis(),
-               currentWeight,
-               currentPrice,
-               currentTotal,
-               currentItem.c_str());
+               millis(), currentWeight, currentPrice, currentTotal, currentItem.c_str());
 
-      // 调试打印：在串口监视器检查生成的 JSON 是否包含 "value"
-      Serial.print("发送OneNet JSON: ");
-      Serial.println(jsonBuffer);
-
-      // 5. 发布消息
-      if (mqttClient.publish(onenet_topic_post, jsonBuffer))
-      {
-        // 发送成功时不刷屏，失败时提示即可
-      }
-      else
-      {
-        Serial.println("发送失败 (可能是包过大或连接断开)");
+      // 4. 双路同时发送数据
+      if (mqttClientOneNet.connected()) {
+        mqttClientOneNet.publish(onenet_topic_post, jsonBuffer);
+        mqttClientOneNet.loop();
       }
 
-      // 保持 MQTT 心跳
-      mqttClient.loop();
+      if (mqttClientPublic.connected()) {
+        mqttClientPublic.publish(public_topic_post, jsonBuffer);
+        mqttClientPublic.loop();
+      }
     }
-
-    // 发送频率：1秒一次
+    
     vTaskDelay(pdMS_TO_TICKS(1000));
   }
 }
-/*************************************************************************************************/
-//                             辅助函数实现 (无重大修改)
-/*************************************************************************************************/
-float getWeight()
-{
-  int retryCount = 0;
-  while (retryCount < 5 && !scale.is_ready())
-  {
-    delayMicroseconds(500);
-    retryCount++;
-  }
-  if (retryCount >= 5)
-  {
-    return 0.0;
-  }
-  return scale.get_units(10);
-}
+
+// =========================== 辅助函数实现 ===========================
+
 void flushSerialBuffer(size_t count)
 {
   uint32_t start_time = millis();
@@ -736,6 +788,7 @@ void flushSerialBuffer(size_t count)
     }
   }
 }
+
 bool findStartMarker()
 {
   int bytes_matched = 0;
@@ -757,6 +810,7 @@ bool findStartMarker()
   }
   return false;
 }
+
 void loadPriceList()
 {
   Serial.println("\n--- 正在加载价目表 ---");
@@ -783,34 +837,10 @@ void loadPriceList()
   file.close();
   Serial.printf("价目表加载完毕。共加载了 %d 个条目。\n", priceList.size());
 }
-String getAccessToken()
-{
-  if (WiFi.status() != WL_CONNECTED)
-  {
-    Serial.println("错误(getAccessToken): WiFi未连接!");
-    return "";
-  }
-  HTTPClient http;
-  String accessToken = "";
-  String postData = "grant_type=client_credentials&client_id=" + apiKey + "&client_secret=" + secretKey;
-  http.begin(tokenUrl);
-  http.addHeader("Content-Type", "application/x-w-form-urlencoded");
-  int httpCode = http.POST(postData);
-  if (httpCode == HTTP_CODE_OK)
-  {
-    String payload = http.getString();
-    DynamicJsonDocument doc(1024);
-    deserializeJson(doc, payload);
-    accessToken = doc["access_token"].as<String>();
-  }
-  else
-  {
-    Serial.printf("[HTTP] 获取Token失败, HTTP代码: %d, 错误: %s\n", httpCode, http.errorToString(httpCode).c_str());
-  }
-  http.end();
-  return accessToken;
-}
-String recognizeIngredient(String accessToken, String base64Image)
+
+// =========================== Qwen 视觉识别 API 调用 ===========================
+// 参数采用常量引用，避免大字符串内存溢出
+String recognizeIngredient(const String& base64Image) 
 {
   if (WiFi.status() != WL_CONNECTED)
   {
@@ -819,17 +849,31 @@ String recognizeIngredient(String accessToken, String base64Image)
   }
   HTTPClient http;
   String itemName = "";
-  String requestUrl = String(apiUrl) + "?access_token=" + accessToken;
-  String postData = "image=" + urlEncode(base64Image);
-  http.begin(requestUrl);
-  http.setTimeout(20000);
-  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-  int httpCode = http.POST(postData);
+  
+  http.begin(apiUrl);
+  http.setTimeout(30000); // 视觉大模型推理时间较长，设置30秒超时
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Authorization", "Bearer " + qwenApiKey);
+
+  // 拼接 JSON Payload 
+  String payload;
+  payload.reserve(base64Image.length() + 512); // 避免内存碎片
+  
+  // Prompt (提示词)
+  payload = "{\"model\":\"qwen-vl-plus\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"你是一个电子秤的视觉识别程序。请识别图片中的果蔬或农产品。请仅输出确切的名称（如：苹果、土豆、胡萝卜），绝不要输出任何多余的字符、标点符号或解释说明。如果无法识别或不是常见食材，请直接输出'非果蔬食材'。\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/jpeg;base64,";
+  payload += base64Image;
+  payload += "\"}}]}]}";
+
+  int httpCode = http.POST(payload);
+  
   if (httpCode == HTTP_CODE_OK)
   {
-    String payload = http.getString();
-    DynamicJsonDocument doc(4096);
-    DeserializationError error = deserializeJson(doc, payload);
+    String response = http.getString();
+    
+    // 【优化】使用 1024 大小足以解析我们需要提取的 Qwen 返回的极简结构，不用消耗过多堆栈
+    DynamicJsonDocument doc(1024);
+    DeserializationError error = deserializeJson(doc, response);
+    
     if (error)
     {
       Serial.print(F("JSON解析失败: "));
@@ -837,37 +881,17 @@ String recognizeIngredient(String accessToken, String base64Image)
       http.end();
       return "";
     }
-    if (doc.containsKey("result"))
+    
+    if (doc.containsKey("choices"))
     {
-      JsonArray results = doc["result"].as<JsonArray>();
-      JsonObject finalResult;
-      if (results.size() > 0)
-      {
-        JsonObject firstResult = results[0];
-        if (firstResult["name"] == "非果蔬食材" && results.size() > 1)
-        {
-          finalResult = results[1];
-        }
-        else
-        {
-          finalResult = firstResult;
-        }
-        itemName = finalResult["name"].as<String>();
-        Serial.printf("识别成功: [%s] (置信度: %.1f%%)\n", itemName.c_str(), finalResult["score"].as<double>() * 100);
-      }
-      else
-      {
-        Serial.println("API返回结果为空。");
-      }
+      itemName = doc["choices"][0]["message"]["content"].as<String>();
+      itemName.trim(); // 移除前后的空格或换行符
+      Serial.printf("Qwen 识别成功: [%s]\n", itemName.c_str());
     }
-    else if (doc.containsKey("error_msg"))
+    else if (doc.containsKey("error"))
     {
       Serial.print("API 返回错误: ");
-      Serial.println(doc["error_msg"].as<String>());
-    }
-    else
-    {
-      Serial.println("API响应格式错误。");
+      Serial.println(doc["error"]["message"].as<String>());
     }
   }
   else
@@ -876,118 +900,22 @@ String recognizeIngredient(String accessToken, String base64Image)
     Serial.println("错误详情: " + http.getString());
   }
   http.end();
+  
+  // 安全过滤：防止大模型偶尔输出带标点符号的结尾
+  itemName.replace("。", "");
+  itemName.replace("！", "");
+  
   return itemName;
 }
-String urlEncode(String str)
-{
-  String encodedString = "";
-  encodedString.reserve(str.length() * 1.1);
-  for (char c : str)
-  {
-    if (isalnum(c))
-    {
-      encodedString += c;
-    }
-    else if (c == '+')
-    {
-      encodedString += "%2B";
-    }
-    else if (c == '/')
-    {
-      encodedString += "%2F";
-    }
-    else if (c == '=')
-    {
-      encodedString += "%3D";
-    }
-    else
-    {
-      char hex[4];
-      sprintf(hex, "%%%02X", c);
-      encodedString += hex;
-    }
+
+void setLED(int color) {
+  onboardLED.clear();
+  if (color == 1) { // 红色 (未联网)
+    onboardLED.setPixelColor(0, onboardLED.Color(100, 0, 0));
+  } else if (color == 2) { // 绿色 (自动模式)
+    onboardLED.setPixelColor(0, onboardLED.Color(0, 100, 0));
+  } else if (color == 3) { // 蓝色 (手动模式)
+    onboardLED.setPixelColor(0, onboardLED.Color(0, 0, 100));
   }
-  return encodedString;
-}
-void setLED(int color)
-{
-  digitalWrite(RED_PIN, LOW);
-  digitalWrite(GREEN_PIN, LOW);
-  digitalWrite(BLUE_PIN, LOW);
-
-  if (color == 1)
-  {
-    digitalWrite(RED_PIN, HIGH);
-  }
-  else if (color == 2)
-  {
-    digitalWrite(GREEN_PIN, HIGH);
-  }
-  else if (color == 3)
-  {
-    digitalWrite(BLUE_PIN, HIGH);
-  }
-}
-// =================================================================
-// ==              处理ASRPRO语音指令                           ==
-// =================================================================
-void handleAsrInput()
-{
-  if (ASRSerial.available())
-  {
-    uint8_t command = ASRSerial.read(); // 读取指令
-    Serial.printf("收到语音指令代码: 0x%02X\n", command);
-
-    switch (command)
-    {
-    case 0x01: // 假设 0x01 代表 "去皮"
-      Serial.println("语音指令: 执行去皮。");
-      performTare();
-      break;
-
-    case 0x02: // 假设 0x02 代表 "切换模式"
-      Serial.println("语音指令: 切换模式。");
-      // 这段逻辑与按下 'A' 键完全相同
-      if (currentMode == AUTOMATIC_MODE)
-      {
-        currentMode = MANUAL_MODE;
-        Serial.println("模式切换 -> 自定义价格模式");
-      }
-      else
-      {
-        currentMode = AUTOMATIC_MODE;
-        Serial.println("模式切换 -> 自动识别模式");
-      }
-      if (xSemaphoreTake(displayDataMutex, portMAX_DELAY) == pdTRUE)
-      {
-        lastRecognizedItemName = "";
-        lastUnitPrice = 0.0;
-        manualPriceInput = "";
-        xSemaphoreGive(displayDataMutex);
-      }
-      break;
-
-    case 0x03: // 假设 0x03 代表 "确认" (用于手动模式)
-      if (currentMode == MANUAL_MODE && manualPriceInput.length() > 0)
-      {
-        Serial.println("语音指令: 确认价格。");
-        if (xSemaphoreTake(displayDataMutex, portMAX_DELAY) == pdTRUE)
-        {
-          lastUnitPrice = manualPriceInput.toFloat();
-          lastRecognizedItemName = "自定义商品";
-          manualPriceInput = "";
-          xSemaphoreGive(displayDataMutex);
-          Serial.printf("自定义价格已设定: %.2f 元/千克\n", lastUnitPrice);
-        }
-      }
-      break;
-
-      // 你可以根据ASRPRO设置的词条添加更多 case
-      // 例如：case 0x04: handlePriceQuery("苹果"); break;
-
-    default:
-      Serial.println("收到未知语音指令。");
-      break;
-    }
-  }
+  onboardLED.show();
 }
