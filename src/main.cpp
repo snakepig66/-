@@ -45,7 +45,8 @@ WiFiClient espClientPublic;
 PubSubClient mqttClientPublic(espClientPublic);
 
 // =========================== 硬件引脚配置 ==========================
-#define JPG_SERIAL_RX_PIN 18 // 图像串口接收引脚 (连接到图像发送模块的TX)
+#define PIR_PIN 45           // HC-SR501 人体红外传感器引脚
+#define JPG_SERIAL_RX_PIN 44 // 图像串口接收引脚 (连接到图像发送模块的TX)
 //#define JPG_SERIAL_TX_PIN 17 // 图像串口发送引脚 (连接到图像发送模块的RX)
 #define JPG_SERIAL_TX_PIN 1  // 使用空闲 1 引脚接摄像头板 RX (44)
 #define SD_CS_PIN 10         // SD卡片选引脚
@@ -92,8 +93,8 @@ const int WIFI_CONNECTED_BIT = BIT0;
 
 // ========================= 全局对象与变量 =========================
 HardwareSerial ASRSerial(2);
-#define ASR_RX_PIN 45
-#define ASR_TX_PIN 48
+#define ASR_RX_PIN 8
+#define ASR_TX_PIN 9
 
 HardwareSerial JPGSerial(1);
 SPIClass SDSPI(HSPI);
@@ -115,11 +116,16 @@ volatile float global_weight = 0.0;
 volatile bool isRecognizing = false;
 String pendingImageBase64 = "";
 
+// 屏幕休眠控制
+unsigned long last_motion_time = 0;
+bool is_sleeping = false;
+
 // ============================ 函数声明 ============================
 void wifiManagementTask(void *pvParameters);
 void lcdDisplayTask(void *pvParameters);
 void oneNetDataTask(void *pvParameters);
 void aiRecognitionTask(void *pvParameters); // 【优化】新增任务：负责处理耗时的AI网络请求
+void checkIncomingImage(); // 检查是否有传入图像
 
 // 参数采用 const String&，避免大字符串深拷贝
 String recognizeIngredient(const String& base64Image); 
@@ -144,12 +150,12 @@ void setup()
   Serial.printf("主程序 setup() 运行在核心: %d\n", xPortGetCoreID());
 
   ASRSerial.begin(9600, SERIAL_8N1, ASR_RX_PIN, ASR_TX_PIN);
-  Serial.println("ASRPRO 语音识别模块串口已在 GPIO 45/48 上初始化。");
+  Serial.println("ASRPRO 语音识别模块串口已在 GPIO 8/9 上初始化。");
 
   onboardLED.begin();
   onboardLED.setBrightness(50); // 设置亮度(0-255)，50为推荐值
   onboardLED.show();
-  setLED(3); // 启动时显示蓝色（手动模式）
+  setLED(1); // 初始化为红灯（未连接WiFi）
 
   u8g2.begin();
   u8g2.enableUTF8Print();
@@ -169,12 +175,16 @@ void setup()
   // 分配更大串口接收缓冲区(32KB)，防止高波特率下丢包
   JPGSerial.setRxBufferSize(32768); 
   JPGSerial.begin(921600, SERIAL_8N1, JPG_SERIAL_RX_PIN, JPG_SERIAL_TX_PIN);
+  Serial.printf("JPGSerial 已初始化, RX引脚: %d, TX引脚: %d\n", JPG_SERIAL_RX_PIN, JPG_SERIAL_TX_PIN);
 
   Serial.println("正在初始化 HX711 称重模块...");
   scale.begin(HX711_DOUT_PIN, HX711_SCK_PIN);
   scale.set_scale(calibration_factor);
   scale.tare();
   Serial.println("HX711 初始化完成，已去皮。");
+
+  pinMode(PIR_PIN, INPUT);
+  last_motion_time = millis(); // 初始化人体红外时间
 
   displayDataMutex = xSemaphoreCreateMutex();
   aiDataMutex = xSemaphoreCreateMutex(); // 初始化 AI 数据锁
@@ -224,33 +234,48 @@ void loop()
   handleKeypadInput();
   handleAsrInput();
   
-  if (currentMode == AUTOMATIC_MODE)
-  {
-    handleAutomaticMode();
-  }
-  else
+  checkIncomingImage(); // 随时监听并处理摄像头传来的图像
+  
+  if (currentMode == MANUAL_MODE)
   {
     handleManualMode();
   }
 }
 
-// ===================== 自动识别模式核心逻辑 =====================
-void handleAutomaticMode()
+// ===================== 自动处理图像核心逻辑 =====================
+void checkIncomingImage()
 {
-  if ((xEventGroupGetBits(wifiEventGroup) & WIFI_CONNECTED_BIT) == 0)
-  {
-    Serial.println("自动模式错误: WiFi 未连接!");
-    u8g2.clearBuffer();
-    u8g2.setFont(u8g2_font_wqy12_t_gb2312);
-    u8g2.drawUTF8(10, 38, "错误: WiFi未连接!");
-    u8g2.sendBuffer();
-    delay(2000);
-    currentMode = MANUAL_MODE;
-    return;
+  if (JPGSerial.available()) {
+    // 这里加个提示看看是不是收到了随便什么数据
+    // Serial.println(">>> 发现 JPGSerial 串口有数据进来...");
   }
-
+  
   if (findStartMarker())
   {
+    Serial.println(">>> 成功匹配到图片起始标记 START_MARKER！");
+    if ((xEventGroupGetBits(wifiEventGroup) & WIFI_CONNECTED_BIT) == 0)
+    {
+      Serial.println("收到图像，但WiFi未连接，无法识别!");
+      // 等待一点时间再清空串口缓冲，防止还没发完
+      delay(500);
+      flushSerialBuffer(100000); 
+      return;
+    }
+
+    // 不管之前是什么模式，收到图片立刻切换为自动模式
+    if (currentMode == MANUAL_MODE)
+    {
+      currentMode = AUTOMATIC_MODE;
+      Serial.println("收到摄像头拍照，自动切换到自动识别模式");
+      if (xSemaphoreTake(displayDataMutex, portMAX_DELAY) == pdTRUE)
+      {
+        lastRecognizedItemName = "";
+        lastUnitPrice = 0.0;
+        manualPriceInput = "";
+        xSemaphoreGive(displayDataMutex);
+      }
+    }
+
     uint32_t image_size = 0;
     if (JPGSerial.readBytes((uint8_t *)&image_size, sizeof(image_size)) != sizeof(image_size))
     {
@@ -449,6 +474,26 @@ void handleAsrInput()
           manualPriceInput = "";
           xSemaphoreGive(displayDataMutex);
           Serial.printf("自定义价格已设定: %.2f 元/千克\n", lastUnitPrice);
+          ASRSerial.print("价格已确认"); // 语音反馈
+        }
+      }
+      break;
+
+    case 0x04: 
+      Serial.println("语音指令: 请求当前种类。");
+      if (xSemaphoreTake(displayDataMutex, portMAX_DELAY) == pdTRUE)
+      {
+        String name = lastRecognizedItemName;
+        xSemaphoreGive(displayDataMutex);
+        if (name.length() > 0)
+        {
+          ASRSerial.print("当前商品是" + name);
+          Serial.println("已向ASR发送TTS播报: 当前商品是" + name);
+        }
+        else
+        {
+          ASRSerial.print("当前未识别到商品");
+          Serial.println("已向ASR发送TTS播报: 当前未识别到商品");
         }
       }
       break;
@@ -471,6 +516,7 @@ void performTare()
 
   scale.tare();
   global_weight = 0.0; // 去皮后重置全局重量
+
 
   Serial.println("去皮完成。");
   u8g2.clearBuffer();
@@ -567,6 +613,15 @@ void lcdDisplayTask(void *pvParameters)
     u8g2.sendBuffer();
     // 实时打包 JSON 数据发给摄像头屏幕
     String screenItemName = itemNameForDisplay;
+    String screenStatus;
+    
+    if (aiIsWorking) {
+        screenStatus = "AI识别中...";
+    } else if (currentMode == AUTOMATIC_MODE) {
+        screenStatus = "自动模式";
+    } else {
+        screenStatus = "手动模式";
+    }
     
     // 商品名称为空时，显示友好提示
     if (screenItemName.length() == 0) {
@@ -575,20 +630,43 @@ void lcdDisplayTask(void *pvParameters)
       else screenItemName = "等待拍照识别...";
     }
 
-    // 注意结尾需加 \n，摄像头板按换行拆包
-char screenJson[256];
-    snprintf(screenJson, sizeof(screenJson),
-             "{\"item\":\"%s\",\"weight\":%.0f,\"price\":%.2f,\"total\":%.2f,\"input\":\"%s\"}\n", 
-             screenItemName.c_str(), currentWeight, unitPriceForDisplay, totalPrice, priceInputForDisplay.c_str());
+    // 检查 HC-SR501 状态，控制休眠
+    static int last_pir_state = LOW;
+    int current_pir_state = digitalRead(PIR_PIN);
     
-    // 仅数据变化时才发送，避免串口堵塞
+    if (current_pir_state != last_pir_state) {
+        Serial.printf("[PIR] HC-SR501 状态改变: %s\n", current_pir_state == HIGH ? "有人 (HIGH)" : "无人 (LOW)");
+        last_pir_state = current_pir_state;
+    }
+
+    if (current_pir_state == HIGH) {
+      last_motion_time = millis();
+      if (is_sleeping) {
+          Serial.println("[PIR] 唤醒屏幕");
+      }
+      is_sleeping = false;
+    } else if (!is_sleeping && (millis() - last_motion_time > 60000)) {
+      Serial.println("[PIR] 60秒无人，触发休眠");
+      is_sleeping = true;
+    }
+
+    // 注意结尾需加 \n，摄像头板按换行拆包
+    char screenJson[256];
+    snprintf(screenJson, sizeof(screenJson),
+             "{\"status\":\"%s\",\"item\":\"%s\",\"weight\":%.0f,\"price\":%.2f,\"total\":%.2f,\"input\":\"%s\",\"sleep\":%d}\n", 
+             screenStatus.c_str(), screenItemName.c_str(), currentWeight, unitPriceForDisplay, totalPrice, priceInputForDisplay.c_str(), is_sleeping ? 1 : 0);
+    
     static String lastSentJson = "";
+    static unsigned long lastSendTime = 0;
     String currentJson = String(screenJson);
     
-    //
-    if (currentJson != lastSentJson) {
-      JPGSerial.print(screenJson);
+    // 数据变化 或 每隔1秒 定时发送，防止摄像头端超时导致屏幕闪退
+    if (currentJson != lastSentJson || (millis() - lastSendTime > 1000)) {
+      if (millis() > 6000) { // 开机前6秒不通过TX发送数据，防止干扰屏幕端开机
+        JPGSerial.print(screenJson);
+      }
       lastSentJson = currentJson;
+      lastSendTime = millis();
     }
 
     vTaskDelay(pdMS_TO_TICKS(100)); // 10Hz 刷新率，画面流畅
@@ -622,10 +700,7 @@ void wifiManagementTask(void *pvParameters)
     if (WiFi.status() == WL_CONNECTED)
     {
       xEventGroupSetBits(wifiEventGroup, WIFI_CONNECTED_BIT);
-      if (currentMode == AUTOMATIC_MODE)
-        setLED(2);
-      else
-        setLED(3);
+      setLED(2);
     }
     else
     {
@@ -842,6 +917,11 @@ void loadPriceList()
 // 参数采用常量引用，避免大字符串内存溢出
 String recognizeIngredient(const String& base64Image) 
 {
+  Serial.println(">>> 进入 recognizeIngredient 函数");
+  Serial.printf(">>> 当前可用堆内存 (Heap): %d bytes\n", ESP.getFreeHeap());
+  Serial.printf(">>> 当前可用 PSRAM: %d bytes\n", ESP.getFreePsram());
+  Serial.printf(">>> 待发送的 Base64 图像长度: %d 字节\n", base64Image.length());
+
   if (WiFi.status() != WL_CONNECTED)
   {
     Serial.println("错误(recognizeIngredient): WiFi未连接!");
@@ -856,6 +936,7 @@ String recognizeIngredient(const String& base64Image)
   http.addHeader("Authorization", "Bearer " + qwenApiKey);
 
   // 拼接 JSON Payload 
+  Serial.println(">>> 正在拼接 JSON Payload...");
   String payload;
   payload.reserve(base64Image.length() + 512); // 避免内存碎片
   
@@ -864,11 +945,18 @@ String recognizeIngredient(const String& base64Image)
   payload += base64Image;
   payload += "\"}}]}]}";
 
+  Serial.printf(">>> Payload 拼接完成，总长度: %d 字节\n", payload.length());
+  Serial.println(">>> 正在发送 POST 请求至 Qwen API...");
+
   int httpCode = http.POST(payload);
   
+  Serial.printf(">>> POST 请求结束，HTTP 状态码: %d\n", httpCode);
+
   if (httpCode == HTTP_CODE_OK)
   {
     String response = http.getString();
+    Serial.println(">>> 收到服务器响应 (OK)，原始数据长度: " + String(response.length()));
+    Serial.println(">>> 响应内容片段: " + response.substring(0, 150) + "..."); // 打印前面一部分看看
     
     // 【优化】使用 1024 大小足以解析我们需要提取的 Qwen 返回的极简结构，不用消耗过多堆栈
     DynamicJsonDocument doc(1024);
@@ -876,7 +964,7 @@ String recognizeIngredient(const String& base64Image)
     
     if (error)
     {
-      Serial.print(F("JSON解析失败: "));
+      Serial.print(F(">>> JSON解析失败: "));
       Serial.println(error.c_str());
       http.end();
       return "";
@@ -886,18 +974,28 @@ String recognizeIngredient(const String& base64Image)
     {
       itemName = doc["choices"][0]["message"]["content"].as<String>();
       itemName.trim(); // 移除前后的空格或换行符
-      Serial.printf("Qwen 识别成功: [%s]\n", itemName.c_str());
+      Serial.printf(">>> Qwen 识别成功: [%s]\n", itemName.c_str());
     }
     else if (doc.containsKey("error"))
     {
-      Serial.print("API 返回错误: ");
+      Serial.print(">>> API 返回错误: ");
       Serial.println(doc["error"]["message"].as<String>());
     }
+    else 
+    {
+      Serial.println(">>> 未知错误：JSON 未包含 choices 也没有 error 字段！");
+      Serial.println(">>> 完整 JSON 数据: " + response);
+    }
+  }
+  else if (httpCode < 0)
+  {
+    Serial.printf(">>> 请求失败！HTTPClient 内部错误代码: %d\n", httpCode);
+    Serial.printf(">>> 错误含义: %s\n", http.errorToString(httpCode).c_str());
   }
   else
   {
-    Serial.printf("服务器返回错误, HTTP状态码: %d\n", httpCode);
-    Serial.println("错误详情: " + http.getString());
+    Serial.printf(">>> 服务器返回非正常 HTTP 状态码: %d\n", httpCode);
+    Serial.println(">>> 错误详情: " + http.getString());
   }
   http.end();
   
@@ -905,6 +1003,7 @@ String recognizeIngredient(const String& base64Image)
   itemName.replace("。", "");
   itemName.replace("！", "");
   
+  Serial.printf(">>> recognizeIngredient 返回的结果: [%s]\n", itemName.c_str());
   return itemName;
 }
 
@@ -912,10 +1011,8 @@ void setLED(int color) {
   onboardLED.clear();
   if (color == 1) { // 红色 (未联网)
     onboardLED.setPixelColor(0, onboardLED.Color(100, 0, 0));
-  } else if (color == 2) { // 绿色 (自动模式)
+  } else if (color == 2) { // 绿色 (已联网)
     onboardLED.setPixelColor(0, onboardLED.Color(0, 100, 0));
-  } else if (color == 3) { // 蓝色 (手动模式)
-    onboardLED.setPixelColor(0, onboardLED.Color(0, 0, 100));
   }
   onboardLED.show();
 }
